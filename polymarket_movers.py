@@ -230,6 +230,8 @@ class Config:
     optional_min_volume_24h: Optional[float]
     optional_league_allowlist: List[str]
     dry_run: bool
+    log_rejected_events: bool
+    log_rejected_events_sample: int
 
 
 @dataclass
@@ -361,6 +363,8 @@ class PolymarketSportsMovers:
         self.instance_lock_handle = None
         self.last_tag_sources: Dict[str, str] = {}
         self.batch_price_fetch_disabled = False
+        self.rejected_event_log_count = 0
+        self.rejected_event_log_samples: List[Dict[str, Any]] = []
 
     def run(self) -> None:
         self._acquire_instance_lock()
@@ -408,6 +412,8 @@ class PolymarketSportsMovers:
 
     def refresh_universe(self) -> None:
         logging.info("Universe refresh started")
+        self.rejected_event_log_count = 0
+        self.rejected_event_log_samples = []
         now = datetime.now(tz=UTC)
         horizon = now + timedelta(days=self.config.horizon_days)
         events, tag_sources, raw_sports_tagged_events, source_counts = self._fetch_sports_universe()
@@ -562,6 +568,7 @@ class PolymarketSportsMovers:
         self._log_market_reject_reason_counts(market_reject_reason_counts)
         self._log_universe_summary(sport_counts, league_counts)
         self._log_source_pipeline(source_counts)
+        self._log_rejected_event_samples()
         self._log_lost_events(lost_events)
         if self.config.dry_run:
             self._log_candidate_events(candidate_events)
@@ -610,20 +617,20 @@ class PolymarketSportsMovers:
                 continue
 
             outcomes_with_price += 1
-            midpoint = quote.midpoint
+            current_price = self._monitored_price(quote)
             if ref.market_id in filtered_market_ids:
                 continue
 
             monitored_refs.append(ref)
             history = self.price_history[key]
-            history.append((now_ts, midpoint))
+            history.append((now_ts, current_price))
             self._trim_history(history, now_ts)
             old_price, lookback_age_sec = self._price_at_lookback(history, now_ts)
-            move_pp_value = abs(midpoint - old_price) * 100.0 if old_price is not None else None
+            move_pp_value = abs(current_price - old_price) * 100.0 if old_price is not None else None
             if len(price_samples) < 20:
                 price_samples.append((ref, quote, old_price, move_pp_value, lookback_age_sec))
             if move_pp_value is not None:
-                movers.append((move_pp_value, ref, midpoint, old_price))
+                movers.append((move_pp_value, ref, current_price, old_price))
             if old_price is None:
                 continue
 
@@ -636,26 +643,49 @@ class PolymarketSportsMovers:
             if not self._cooldown_expired(key, now_ts):
                 continue
 
-            direction = "UP" if midpoint > old_price else "DOWN"
+            direction = "UP" if current_price > old_price else "DOWN"
             self.cooldowns[key] = now_ts
-            self._write_alert_csv(scanned_at, ref, old_price, midpoint, move_pp, direction)
-            self.notifier.send(self._format_alert(ref, old_price, midpoint, move_pp, direction))
+            self._write_alert_csv(scanned_at, ref, old_price, current_price, move_pp, direction)
+            self.notifier.send(self._format_alert(ref, old_price, current_price, move_pp, direction))
             alerts_triggered += 1
 
         history_keys = sum(1 for history in self.price_history.values() if history)
         history_points = sum(len(history) for history in self.price_history.values())
+        lookback_ready_count = 0
+        lookback_missing_count = 0
+        for key in self.outcomes:
+            prev_price, _lookback_age_sec = self._price_at_lookback(self.price_history[key], now_ts)
+            if prev_price is not None:
+                lookback_ready_count += 1
+            else:
+                lookback_missing_count += 1
         logging.info("Outcomes with price count: %s", outcomes_with_price)
         self._log_market_reject_reason_counts(price_reject_counts)
         self._log_monitoring_outcomes(monitored_refs, filtered_market_hits)
         self._log_price_samples(price_samples)
         self._log_top_movers(movers)
+        logging.info(
+            "Lookback readiness: lookback_ready_count=%s | lookback_missing_count=%s | history_points_total=%s | history_cache_size=%s",
+            lookback_ready_count,
+            lookback_missing_count,
+            history_points,
+            history_keys,
+        )
         logging.info("History points count: %s | cache size: %s", history_points, history_keys)
         logging.info("Alert checks count: %s", alert_checks_count)
         logging.info("Alerts triggered count: %s", alerts_triggered)
 
     def _fetch_sports_universe(self) -> Tuple[List[Dict[str, Any]], Dict[str, str], int, Dict[str, Dict[str, int]]]:
+        sports_metadata: List[Dict[str, Any]] = []
+        try:
+            sports_metadata = self._fetch_sports_metadata()
+        except requests.RequestException as exc:
+            logging.warning("Не удалось получить sports metadata: %s", exc)
+        except ValueError as exc:
+            logging.warning("Не удалось разобрать sports metadata: %s", exc)
+
         tags = self._fetch_all_tags()
-        tag_sources = self._resolve_target_tag_ids(tags)
+        tag_sources = self._resolve_target_tag_ids(sports_metadata, tags)
         if not tag_sources:
             raise ValueError("Не удалось определить sports tag_id для целевых лиг")
 
@@ -706,6 +736,18 @@ class PolymarketSportsMovers:
                         existing[key] = value
                 existing["_source_tags"] = merged_sources
         return list(deduped_events.values()), tag_sources, len(raw_events), source_counts
+
+    def _fetch_sports_metadata(self) -> List[Dict[str, Any]]:
+        response = self._gamma_get("/sports")
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            sports = data.get("sports")
+            if isinstance(sports, list):
+                return sports
+        raise ValueError("Неожиданный ответ sports API")
 
     def _fetch_all_tags(self) -> List[Dict[str, Any]]:
         limit = 500
@@ -765,8 +807,25 @@ class PolymarketSportsMovers:
             offset += limit
         return events
 
-    def _resolve_target_tag_ids(self, tags: List[Dict[str, Any]]) -> Dict[str, str]:
+    def _resolve_target_tag_ids(
+        self,
+        sports_metadata: List[Dict[str, Any]],
+        tags: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
         resolved: Dict[str, str] = {}
+
+        for item in sports_metadata:
+            sport_name = str(item.get("sport") or "").strip().lower()
+            if not sport_name:
+                continue
+            for normalized_sport, aliases in SPORTS_METADATA_SPORTS.items():
+                if sport_name not in aliases:
+                    continue
+                if normalized_sport == "football":
+                    break
+                for tag_id in self._csv_list(item.get("tags")):
+                    resolved[tag_id] = f"sports:{sport_name}"
+                break
 
         for tag in tags:
             tag_id = str(tag.get("id") or "").strip()
@@ -775,7 +834,23 @@ class PolymarketSportsMovers:
             haystack = f" {label} {slug} ".lower()
             if not tag_id or not haystack.strip():
                 continue
-            if any(prefix in haystack for prefix in (" sports:", " sports-", " all sports ", " sport ")):
+
+            if " all sports " in haystack:
+                continue
+
+            for sport_name, keywords in SPORTS_METADATA_SPORTS.items():
+                if sport_name == "football":
+                    continue
+                sports_prefixes = tuple(f" sports:{keyword}" for keyword in keywords) + tuple(
+                    f" sports-{keyword}" for keyword in keywords
+                )
+                if any(prefix in haystack for prefix in sports_prefixes):
+                    resolved[tag_id] = f"sports:{sport_name}"
+                    break
+            if tag_id in resolved:
+                continue
+
+            if " sport " in haystack:
                 continue
             for target_name, keywords in TARGET_LEAGUE_TAGS.items():
                 if any(keyword in haystack for keyword in keywords):
@@ -893,7 +968,7 @@ class PolymarketSportsMovers:
                 ask=best_ask,
                 midpoint=midpoint,
                 spread_pp=spread_pp,
-                source=f"{path}:midpoint_from_best_bid_ask(best_bid={best_bid:.4f},best_ask={best_ask:.4f},spread_pp={spread_pp:.2f})",
+                source=f"{path}:best_ask(best_ask={best_ask:.4f},best_bid={best_bid:.4f},spread_pp={spread_pp:.2f})",
             ), None
 
         if last_error is not None:
@@ -997,7 +1072,6 @@ class PolymarketSportsMovers:
                 str(event.get("question") or ""),
                 str(market.get("question") or ""),
                 str(market.get("title") or ""),
-                str(market.get("description") or ""),
             ]
         ).lower()
 
@@ -1383,6 +1457,32 @@ class PolymarketSportsMovers:
                 item["reason"],
             )
 
+    def _log_rejected_event_samples(self) -> None:
+        if self.config.log_rejected_events:
+            return
+        if self.rejected_event_log_count == 0:
+            logging.info("Rejected events sample: none")
+            return
+        logging.info(
+            "Rejected events sample: showing first %s of %s",
+            len(self.rejected_event_log_samples),
+            self.rejected_event_log_count,
+        )
+        for idx, item in enumerate(self.rejected_event_log_samples, start=1):
+            logging.info(
+                "REJECTED EVENT SAMPLE %02d | sport=%s | league=%s | event=%s | start=%s | start_source=%s | markets=%s | candidate_markets=%s | source=%s | reason=%s",
+                idx,
+                item["sport"],
+                item["league"],
+                item["event"],
+                item["start"],
+                item["start_source"],
+                item["markets"],
+                item["candidate_markets"],
+                item["source"],
+                item["reason"],
+            )
+
     def _log_candidate_events(self, candidates: List[CandidateEvent]) -> None:
         if not candidates:
             logging.info("Dry-run sports-tagged candidate events: 0")
@@ -1476,6 +1576,38 @@ class PolymarketSportsMovers:
         markets_count: int,
         candidate_market_count: int,
     ) -> None:
+        if prefix == "REJECTED EVENT":
+            if self.config.log_rejected_events:
+                logging.info(
+                    "%s | sport=%s | league=%s | event=%s | start=%s | start_source=%s | markets=%s | candidate_markets=%s | source=%s | reason=%s",
+                    prefix,
+                    self._log_field(sport or "-"),
+                    self._log_field(league or "-"),
+                    self._log_field(str(event.get("title") or event.get("question") or "-")),
+                    event_start.isoformat() if event_start else "-",
+                    event_start_source,
+                    markets_count,
+                    candidate_market_count,
+                    self._log_field(self._event_source_label(event)),
+                    reason,
+                )
+                return
+            self.rejected_event_log_count += 1
+            if len(self.rejected_event_log_samples) < self.config.log_rejected_events_sample:
+                self.rejected_event_log_samples.append(
+                    {
+                        "sport": self._log_field(sport or "-"),
+                        "league": self._log_field(league or "-"),
+                        "event": self._log_field(str(event.get("title") or event.get("question") or "-")),
+                        "start": event_start.isoformat() if event_start else "-",
+                        "start_source": event_start_source,
+                        "markets": markets_count,
+                        "candidate_markets": candidate_market_count,
+                        "source": self._log_field(self._event_source_label(event)),
+                        "reason": reason,
+                    }
+                )
+            return
         logging.info(
             "%s | sport=%s | league=%s | event=%s | start=%s | start_source=%s | markets=%s | candidate_markets=%s | source=%s | reason=%s",
             prefix,
@@ -1612,6 +1744,7 @@ class PolymarketSportsMovers:
             return
         for idx, (ref, quote, prev_price, delta_pp, lookback_age_sec) in enumerate(price_samples, start=1):
             slug_value = ref.event_url if ref.event_url and ref.event_url != "https://polymarket.com" else (ref.market_slug or ref.event_slug or "-")
+            current_price = self._monitored_price(quote)
             logging.info(
                 "PRICE %02d | sport=%s | league=%s | event=%s | market=%s | outcome=%s | asset_id=%s | start=%s | current_price=%.4f | price_source=%s | bid=%.4f | ask=%.4f | prev_price=%s | delta_pp=%s | lookback_age_sec=%s | slug=%s",
                 idx,
@@ -1622,7 +1755,7 @@ class PolymarketSportsMovers:
                 self._log_field(ref.outcome_name or "-"),
                 self._log_field(ref.asset_id or "-"),
                 self._log_field(ref.start_time or "-"),
-                quote.midpoint,
+                current_price,
                 self._log_field(quote.source),
                 quote.bid,
                 quote.ask,
@@ -1844,9 +1977,9 @@ class PolymarketSportsMovers:
                         "event_url",
                         "start_time",
                         "asset_id or market_id",
-                        "old_midpoint",
-                        "new_midpoint",
-                        "midpoint_move_10m_pp",
+                        "old_best_ask",
+                        "new_best_ask",
+                        "best_ask_move_10m_pp",
                         "direction",
                         "live",
                         "ended",
@@ -1882,7 +2015,7 @@ class PolymarketSportsMovers:
         return (
             f"[{ref.sport.upper()} {ref.league}] {ref.event_title}\n"
             f"Маркет: {ref.market_title} | Outcome: {ref.outcome_name}\n"
-            f"MIDPOINT {direction}: {old_price:.3f} -> {new_price:.3f} ({move_pp:.2f} pp за {self.config.lookback_minutes}m)\n"
+            f"BEST_ASK {direction}: {old_price:.3f} -> {new_price:.3f} ({move_pp:.2f} pp за {self.config.lookback_minutes}m)\n"
             f"Старт: {ref.start_time}\n"
             f"{ref.event_url}"
         )
@@ -1988,6 +2121,19 @@ class PolymarketSportsMovers:
             return self._safe_float(entry[0])
         return None
 
+    def _monitored_price(self, quote: PriceQuote) -> float:
+        if 0 < quote.ask <= 1:
+            return quote.ask
+        if 0 < quote.midpoint <= 1:
+            if "fallback_" not in quote.source:
+                quote.source = f"{quote.source}|fallback_midpoint"
+            return quote.midpoint
+        if 0 < quote.bid <= 1:
+            if "fallback_" not in quote.source:
+                quote.source = f"{quote.source}|fallback_best_bid"
+            return quote.bid
+        raise ValueError(f"Некорректная котировка для monitored price: {quote}")
+
     def _best_orderbook_bid(self, entries: List[Any]) -> Optional[float]:
         prices = [price for price in (self._extract_orderbook_price(entry) for entry in entries) if price is not None and 0 < price <= 1]
         return max(prices) if prices else None
@@ -2065,6 +2211,8 @@ def load_config() -> Config:
         optional_min_volume_24h=env_float_optional("OPTIONAL_MIN_VOLUME_24H"),
         optional_league_allowlist=allowlist,
         dry_run=env_bool("DRY_RUN", not env_str("TG_TOKEN") or not env_str("TG_CHAT_ID")),
+        log_rejected_events=env_bool("LOG_REJECTED_EVENTS", False),
+        log_rejected_events_sample=max(0, env_int("LOG_REJECTED_EVENTS_SAMPLE", 20)),
     )
 
 
