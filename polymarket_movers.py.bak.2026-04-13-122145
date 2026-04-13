@@ -1,0 +1,1214 @@
+import asyncio
+import csv
+import json
+import logging
+import os
+import signal
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
+
+import requests
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> None:
+        return None
+
+
+UTC = timezone.utc
+DEFAULT_GAMMA_BASE = "https://gamma.polymarket.com"
+CLOB_BASE_DEFAULT = "https://clob.polymarket.com"
+GAMMA_BASE_FALLBACKS = (
+    "https://gamma.polymarket.com",
+    "https://gamma-api.polymarket.com",
+)
+DEFAULT_POLL_SEC = 30
+REQUEST_TIMEOUT_SEC = 20
+ALERT_CSV = "alerts.csv"
+STATE_JSON = "state.json"
+
+SPORT_ALLOWLIST = {
+    "soccer",
+    "football",
+    "mlb",
+    "baseball",
+    "mma",
+    "ufc",
+    "nba",
+    "basketball",
+    "nhl",
+    "hockey",
+}
+
+LEAGUE_KEYWORDS = {
+    "uefa champions league": "UCL",
+    "champions league": "UCL",
+    "laliga": "LaLiga",
+    "la liga": "LaLiga",
+    "ligue 1": "Ligue 1",
+    "bundesliga": "Bundesliga",
+    "uefa europa league": "UEL",
+    "europa league": "UEL",
+    "premier league": "EPL",
+    "epl": "EPL",
+    "super lig": "Turkish League",
+    "turkish super lig": "Turkish League",
+    "sea games": "SEA",
+    "southeast asia": "SEA",
+    "mlb": "MLB",
+    "ufc": "UFC",
+    "mma": "MMA",
+    "nba": "NBA",
+    "nhl": "NHL",
+}
+
+EXCLUDED_MARKET_TERMS = (
+    "total",
+    "spread",
+    "handicap",
+    "prop",
+    "btts",
+    "both teams to score",
+    "exact score",
+    "advance",
+    "qualify",
+    "double chance",
+    "draw no bet",
+    "1st half",
+    "first half",
+    "quarter",
+    "inning",
+    "round",
+    "method of victory",
+)
+
+SPORTS_EVENT_START_FIELDS = ("startTime", "eventStartTime", "eventDate")
+SPORTS_MARKET_START_FIELDS = ("startTime", "eventStartTime", "eventDate")
+DEBUG_DATE_FIELDS = SPORTS_EVENT_START_FIELDS + ("startDate",)
+SPORTS_METADATA_SPORTS = {
+    "football": ("soccer", "football"),
+    "mlb": ("mlb", "baseball"),
+    "mma": ("mma", "ufc"),
+    "nba": ("nba", "basketball"),
+    "nhl": ("nhl", "hockey"),
+}
+TARGET_LEAGUE_TAGS = {
+    "UCL": ("uefa champions league", "champions league", "ucl"),
+    "LaLiga": ("laliga", "la liga"),
+    "Ligue 1": ("ligue 1",),
+    "Bundesliga": ("bundesliga",),
+    "UEL": ("uefa europa league", "europa league", "uel"),
+    "EPL": ("premier league", "epl"),
+    "Turkish League": ("super lig", "turkish super lig", "turkish league"),
+    "SEA": ("sea games", "southeast asia"),
+    "MLB": ("mlb", "major league baseball"),
+    "UFC": ("ufc", "mma"),
+    "NBA": ("nba",),
+    "NHL": ("nhl",),
+}
+
+
+@dataclass
+class Config:
+    tg_token: str
+    tg_chat_id: str
+    lookback_minutes: int
+    min_move_pp: float
+    horizon_days: int
+    cooldown_minutes: int
+    refresh_universe_sec: int
+    snapshot_dir: Path
+    optional_min_liquidity: Optional[float]
+    optional_min_volume_24h: Optional[float]
+    optional_league_allowlist: List[str]
+    dry_run: bool
+
+
+@dataclass
+class CandidateEvent:
+    sport: str
+    league: str
+    event_title: str
+    start_time: str
+    live: bool
+    ended: bool
+    markets_count: int
+
+
+@dataclass
+class OutcomeRef:
+    key: str
+    asset_id: str
+    outcome_name: str
+    sport: str
+    league: str
+    event_title: str
+    market_title: str
+    event_url: str
+    start_time: str
+    event_live: bool
+    event_ended: bool
+
+
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str, dry_run: bool) -> None:
+        self.token = token
+        self.chat_id = chat_id
+        self.dry_run = dry_run
+        self.session = requests.Session()
+
+    def send(self, text: str) -> None:
+        if self.dry_run or not self.token or not self.chat_id:
+            print(text, flush=True)
+            return
+
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {"chat_id": self.chat_id, "text": text, "disable_web_page_preview": True}
+        try:
+            response = self.session.post(url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logging.warning("Не удалось отправить Telegram alert: %s", exc)
+            print(text, flush=True)
+
+
+class PolymarketSportsMovers:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "polymarket-sports-movers/1.0"})
+        configured_gamma_base = os.getenv("GAMMA_BASE", DEFAULT_GAMMA_BASE).strip()
+        self.gamma_base = configured_gamma_base or DEFAULT_GAMMA_BASE
+        configured_clob_base = os.getenv("CLOB_BASE", CLOB_BASE_DEFAULT).strip()
+        self.clob_base = configured_clob_base or CLOB_BASE_DEFAULT
+        self.notifier = TelegramNotifier(config.tg_token, config.tg_chat_id, config.dry_run)
+        self.outcomes: Dict[str, OutcomeRef] = {}
+        self.price_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
+        self.cooldowns: Dict[str, float] = {}
+        self.last_universe_refresh = 0.0
+        self.next_universe_refresh_monotonic = 0.0
+        self.universe_initialized = False
+        self.stop_event = asyncio.Event()
+        self.snapshot_dir = config.snapshot_dir
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.alerts_csv_path = self.snapshot_dir / ALERT_CSV
+        self.state_json_path = self.snapshot_dir / STATE_JSON
+        self.last_tag_sources: Dict[str, str] = {}
+
+    def run(self) -> None:
+        self._load_state()
+        self._install_signal_handlers()
+        asyncio.run(self._run_loop())
+
+    async def _run_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                if (not self.universe_initialized) or (
+                    time.monotonic() >= self.next_universe_refresh_monotonic
+                ):
+                    self.refresh_universe()
+                self.poll_best_asks()
+                self._prune_history()
+                self._save_state()
+            except Exception as exc:
+                logging.exception("Ошибка цикла мониторинга: %s", exc)
+            await asyncio.sleep(DEFAULT_POLL_SEC)
+
+    def _install_signal_handlers(self) -> None:
+        def handle_stop(signum: int, _frame: Any) -> None:
+            logging.info("Получен сигнал %s, завершаю работу", signum)
+            self.stop_event.set()
+
+        signal.signal(signal.SIGINT, handle_stop)
+        signal.signal(signal.SIGTERM, handle_stop)
+
+    def refresh_universe(self) -> None:
+        logging.info("Universe refresh started")
+        now = datetime.now(tz=UTC)
+        horizon = now + timedelta(days=self.config.horizon_days)
+        events, tag_sources, raw_sports_tagged_events = self._fetch_sports_universe()
+        self.last_tag_sources = tag_sources
+        new_outcomes: Dict[str, OutcomeRef] = {}
+        raw_market_count = 0
+        date_window_count = 0
+        active_count = 0
+        moneyline_count = 0
+        candidate_events: List[CandidateEvent] = []
+        filter_reason_counts: Dict[str, int] = defaultdict(int)
+
+        self._log_raw_event_dates(events, now, "Sports-tagged")
+
+        for event in events:
+            markets = event.get("markets") or []
+            raw_market_count += len(markets)
+            event_start, _start_source = self._choose_event_start(event, markets)
+            sport = self._normalize_sport(event)
+            league = self._normalize_league(event)
+            if not self._sport_league_allowed(sport, league):
+                filter_reason_counts["sport_league_filtered"] += 1
+                continue
+
+            candidate_events.append(
+                CandidateEvent(
+                    sport=sport,
+                    league=league,
+                    event_title=str(event.get("title") or event.get("question") or ""),
+                    start_time=event_start.isoformat() if event_start else "-",
+                    live=bool(event.get("live")),
+                    ended=bool(event.get("ended")),
+                    markets_count=len(markets),
+                )
+            )
+
+            date_filter_reason = self._event_date_filter_reason(event_start, now, horizon)
+            if date_filter_reason:
+                filter_reason_counts[date_filter_reason] += 1
+                continue
+            date_window_count += 1
+
+            activity_filter_reason = self._event_activity_filter_reason(event, event_start, now)
+            if activity_filter_reason:
+                filter_reason_counts[activity_filter_reason] += 1
+                continue
+            active_count += 1
+
+            event_has_moneyline = False
+            for market in markets:
+                if not self._is_primary_moneyline_market(market, sport):
+                    continue
+                if self._market_fails_optional_filters(market):
+                    continue
+                event_has_moneyline = True
+                new_outcomes.update(self._extract_outcomes(event, market, sport, league, event_start))
+            if event_has_moneyline:
+                moneyline_count += 1
+
+        removed = set(self.outcomes) - set(new_outcomes)
+        for key in removed:
+            self.price_history.pop(key, None)
+            self.cooldowns.pop(key, None)
+
+        self.outcomes = new_outcomes
+        self.last_universe_refresh = time.time()
+        self.next_universe_refresh_monotonic = time.monotonic() + self.config.refresh_universe_sec
+        self.universe_initialized = True
+        self._log_refresh_debug(
+            raw_events=raw_sports_tagged_events,
+            deduped_events=len(events),
+            raw_markets=raw_market_count,
+            date_window_events=date_window_count,
+            active_events=active_count,
+            moneyline_events=moneyline_count,
+            tracked_outcomes=len(self.outcomes),
+        )
+        self._log_filter_reason_counts(filter_reason_counts)
+        if self.config.dry_run:
+            self._log_candidate_events(candidate_events)
+        self._log_tag_sources()
+        logging.info("Universe refreshed: %s outcomes", len(self.outcomes))
+        logging.info(
+            "Price polling ready: tracked asset ids count=%s",
+            len({item.asset_id for item in self.outcomes.values() if item.asset_id}),
+        )
+
+    def poll_best_asks(self) -> None:
+        logging.info("Price polling started")
+        if not self.outcomes:
+            logging.info("Нет подходящих outcomes для мониторинга")
+            return
+
+        asset_ids = [item.asset_id for item in self.outcomes.values() if item.asset_id]
+        unique_asset_ids = list(dict.fromkeys(asset_ids))
+        logging.info("Tracked asset ids count: %s", len(unique_asset_ids))
+        if not unique_asset_ids:
+            logging.info("Price polling skipped: нет валидных asset ids")
+            return
+        prices, missing_asset_ids = self._fetch_best_asks(unique_asset_ids)
+        logging.info("Batch price fetch count: %s", len(unique_asset_ids))
+        logging.info("Prices fetched count: %s", len(prices))
+        logging.info("Missing prices count: %s", len(missing_asset_ids))
+        if missing_asset_ids:
+            logging.info("Missing price asset ids sample: %s", ", ".join(missing_asset_ids[:5]))
+        now_ts = time.time()
+        scanned_at = datetime.now(tz=UTC).isoformat()
+        alerts_triggered = 0
+        outcomes_with_price = 0
+        alert_checks_count = 0
+
+        for key, ref in self.outcomes.items():
+            best_ask = prices.get(ref.asset_id)
+            if best_ask is None:
+                continue
+
+            outcomes_with_price += 1
+            history = self.price_history[key]
+            history.append((now_ts, best_ask))
+            self._trim_history(history, now_ts)
+            old_price = self._price_at_lookback(history, now_ts)
+            if old_price is None:
+                continue
+
+            alert_checks_count += 1
+            move_pp = abs(best_ask - old_price) * 100.0
+            if move_pp < self.config.min_move_pp:
+                continue
+            if not self._cooldown_expired(key, now_ts):
+                continue
+
+            direction = "UP" if best_ask > old_price else "DOWN"
+            self.cooldowns[key] = now_ts
+            self._write_alert_csv(scanned_at, ref, old_price, best_ask, move_pp, direction)
+            self.notifier.send(self._format_alert(ref, old_price, best_ask, move_pp, direction))
+            alerts_triggered += 1
+
+        history_keys = sum(1 for history in self.price_history.values() if history)
+        history_points = sum(len(history) for history in self.price_history.values())
+        logging.info("Outcomes with price count: %s", outcomes_with_price)
+        logging.info("History points count: %s | cache size: %s", history_points, history_keys)
+        logging.info("Alert checks count: %s", alert_checks_count)
+        logging.info("Alerts triggered count: %s", alerts_triggered)
+
+    def _fetch_sports_universe(self) -> Tuple[List[Dict[str, Any]], Dict[str, str], int]:
+        sports_metadata = self._fetch_sports_metadata()
+        tags = self._fetch_all_tags()
+        tag_sources = self._resolve_target_tag_ids(sports_metadata, tags)
+        if not tag_sources:
+            raise ValueError("Не удалось определить sports tag_id для целевых лиг")
+
+        raw_events: List[Dict[str, Any]] = []
+        deduped_events: Dict[str, Dict[str, Any]] = {}
+        for tag_id, tag_source in tag_sources.items():
+            tag_events = self._fetch_events_for_tag(tag_id)
+            logging.info("Sports universe fetch: tag_id=%s | source=%s | events=%s", tag_id, tag_source, len(tag_events))
+            raw_events.extend(tag_events)
+            for event in tag_events:
+                event_key = str(event.get("id") or event.get("slug") or event.get("title") or "")
+                if event_key:
+                    deduped_events[event_key] = event
+        return list(deduped_events.values()), tag_sources, len(raw_events)
+
+    def _fetch_sports_metadata(self) -> List[Dict[str, Any]]:
+        response = self._gamma_get("/sports")
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            sports = data.get("sports")
+            if isinstance(sports, list):
+                return sports
+        raise ValueError("Неожиданный ответ sports API")
+
+    def _fetch_all_tags(self) -> List[Dict[str, Any]]:
+        limit = 500
+        offset = 0
+        tags: List[Dict[str, Any]] = []
+        while True:
+            response = self._gamma_get(
+                "/tags",
+                params={"limit": limit, "offset": offset},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                page = data
+            elif isinstance(data, dict) and isinstance(data.get("tags"), list):
+                page = data["tags"]
+            else:
+                raise ValueError("Неожиданный ответ tags API")
+            tags.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+        return tags
+
+    def _fetch_events_for_tag(self, tag_id: str) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        limit = 100
+        offset = 0
+        while True:
+            response = self._gamma_get(
+                "/events",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "tag_id": tag_id,
+                    "order": "start_date",
+                    "ascending": "true",
+                    "limit": limit,
+                    "offset": offset,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                page = data
+            elif isinstance(data, dict) and isinstance(data.get("events"), list):
+                page = data["events"]
+            else:
+                raise ValueError("Неожиданный ответ events API")
+            if not page:
+                break
+            events.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+        return events
+
+    def _resolve_target_tag_ids(
+        self,
+        sports_metadata: List[Dict[str, Any]],
+        tags: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        resolved: Dict[str, str] = {}
+
+        for item in sports_metadata:
+            sport_name = str(item.get("sport") or "").strip().lower()
+            if not sport_name:
+                continue
+            for normalized_sport, aliases in SPORTS_METADATA_SPORTS.items():
+                if sport_name not in aliases:
+                    continue
+                if normalized_sport == "football":
+                    break
+                for tag_id in self._csv_list(item.get("tags")):
+                    resolved[tag_id] = f"sports:{sport_name}"
+                break
+
+        for tag in tags:
+            tag_id = str(tag.get("id") or "").strip()
+            label = str(tag.get("label") or "").strip()
+            slug = str(tag.get("slug") or "").strip()
+            haystack = f"{label} {slug}".lower()
+            if not tag_id or not haystack.strip():
+                continue
+            for target_name, keywords in TARGET_LEAGUE_TAGS.items():
+                if any(keyword in haystack for keyword in keywords):
+                    resolved[tag_id] = f"tags:{target_name}"
+                    break
+
+        return dict(sorted(resolved.items(), key=lambda item: item[1]))
+
+    def _fetch_best_asks(self, asset_ids: Iterable[str]) -> Tuple[Dict[str, float], List[str]]:
+        asset_list = [asset_id for asset_id in asset_ids if asset_id]
+        if not asset_list:
+            return {}, []
+
+        logging.info("Batch price fetch count: %s", len(asset_list))
+        result = self._fetch_best_asks_batch(asset_list)
+        missing_asset_ids = [asset_id for asset_id in asset_list if asset_id not in result]
+        if result:
+            logging.info(
+                "Batch price fetch response: requested=%s | fetched=%s | missing=%s",
+                len(asset_list),
+                len(result),
+                len(missing_asset_ids),
+            )
+        if missing_asset_ids:
+            logging.info("Falling back to per-asset orderbook fetch for %s asset ids", len(missing_asset_ids))
+        fallback_result: Dict[str, float] = {}
+        for asset_id in missing_asset_ids:
+            best_ask = self._fetch_best_ask_from_book(asset_id)
+            if best_ask is not None:
+                fallback_result[asset_id] = best_ask
+        result.update(fallback_result)
+        missing_asset_ids = [asset_id for asset_id in asset_list if asset_id not in result]
+        return result, missing_asset_ids
+
+    def _fetch_best_asks_batch(self, asset_ids: List[str]) -> Dict[str, float]:
+        endpoints = (
+            ("/prices", {"token_ids": ",".join(asset_ids), "side": "sell"}),
+            ("/prices", [("token_id", asset_id) for asset_id in asset_ids] + [("side", "sell")]),
+            ("/midpoints", {"token_ids": ",".join(asset_ids)}),
+        )
+        for path, params in endpoints:
+            try:
+                response = self.session.get(
+                    f"{self.clob_base}{path}",
+                    params=params,
+                    timeout=REQUEST_TIMEOUT_SEC,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                parsed = self._parse_price_entries(payload)
+                logging.info(
+                    "Price batch request ok: path=%s | requested=%s | parsed=%s | payload_type=%s",
+                    path,
+                    len(asset_ids),
+                    len(parsed),
+                    type(payload).__name__,
+                )
+                if parsed:
+                    return parsed
+            except requests.RequestException as exc:
+                logging.info("Price batch request failed: path=%s | error=%s", path, exc)
+            except ValueError as exc:
+                logging.info("Price batch payload parse failed: path=%s | error=%s", path, exc)
+        return {}
+
+    def _gamma_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+        last_error: Optional[requests.RequestException] = None
+        bases: List[str] = []
+        for base in (self.gamma_base, *GAMMA_BASE_FALLBACKS):
+            normalized = base.strip().rstrip("/")
+            if normalized and normalized not in bases:
+                bases.append(normalized)
+
+        for base in bases:
+            try:
+                response = self.session.get(
+                    f"{base}{path}",
+                    params=params,
+                    timeout=REQUEST_TIMEOUT_SEC,
+                )
+                if base != self.gamma_base:
+                    logging.info("Переключаю gamma base на %s", base)
+                    self.gamma_base = base
+                return response
+            except requests.RequestException as exc:
+                last_error = exc
+                logging.warning("Не удалось получить %s через %s: %s", path, base, exc)
+
+        if last_error is None:
+            raise RuntimeError(f"Не удалось выполнить gamma GET {path}")
+        raise last_error
+
+    def _parse_price_entries(self, payload: Any) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+
+        if isinstance(payload, list):
+            entries = payload
+        elif isinstance(payload, dict):
+            if isinstance(payload.get("prices"), list):
+                entries = payload["prices"]
+            elif isinstance(payload.get("data"), list):
+                entries = payload["data"]
+            elif isinstance(payload.get("prices"), dict):
+                entries = []
+                for asset_id, entry in payload["prices"].items():
+                    parsed = self._extract_price_value(entry)
+                    if parsed is not None:
+                        result[str(asset_id)] = parsed
+            else:
+                entries = []
+                for asset_id, entry in payload.items():
+                    parsed = self._extract_price_value(entry)
+                    if parsed is not None:
+                        result[str(asset_id)] = parsed
+        else:
+            entries = []
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            asset_id = str(
+                entry.get("asset_id")
+                or entry.get("assetId")
+                or entry.get("token_id")
+                or entry.get("tokenId")
+                or entry.get("market")
+                or entry.get("market_id")
+                or entry.get("marketId")
+                or ""
+            )
+            parsed = self._extract_price_value(entry)
+            if asset_id and parsed is not None:
+                result[asset_id] = parsed
+
+        return result
+
+    def _fetch_best_ask_from_book(self, asset_id: str) -> Optional[float]:
+        endpoints = (
+            ("/book", {"token_id": asset_id}),
+            ("/book", {"asset_id": asset_id}),
+            ("/orderbook", {"token_id": asset_id}),
+            ("/orderbook", {"asset_id": asset_id}),
+        )
+        last_error: Optional[requests.RequestException] = None
+        last_empty_reason: Optional[str] = None
+        for path, params in endpoints:
+            try:
+                response = self.session.get(
+                    f"{self.clob_base}{path}",
+                    params=params,
+                    timeout=REQUEST_TIMEOUT_SEC,
+                )
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                last_error = exc
+                logging.info("Orderbook request failed: path=%s | asset_id=%s | error=%s", path, asset_id, exc)
+                continue
+
+            payload = response.json()
+            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                payload = payload["data"]
+
+            asks = payload.get("asks") if isinstance(payload, dict) else None
+            if not isinstance(asks, list) or not asks:
+                bids = payload.get("bids") if isinstance(payload, dict) else None
+                bids_count = len(bids) if isinstance(bids, list) else 0
+                last_empty_reason = f"path={path} bids={bids_count}"
+                logging.info("Orderbook without asks: path=%s | asset_id=%s | bids=%s", path, asset_id, bids_count)
+                continue
+
+            parsed_price = self._extract_orderbook_price(asks[0])
+            if parsed_price is not None:
+                return parsed_price
+            last_empty_reason = f"path={path} invalid_first_ask"
+
+        if last_error is not None:
+            logging.warning("Не удалось получить orderbook для %s: %s", asset_id, last_error)
+        elif last_empty_reason is not None:
+            logging.info("Best ask not found for %s: %s", asset_id, last_empty_reason)
+        return None
+
+    def _extract_outcomes(
+        self,
+        event: Dict[str, Any],
+        market: Dict[str, Any],
+        sport: str,
+        league: str,
+        event_start: datetime,
+    ) -> Dict[str, OutcomeRef]:
+        token_ids = self._json_list(market.get("clobTokenIds"))
+        outcomes = self._json_list(market.get("outcomes"))
+        refs: Dict[str, OutcomeRef] = {}
+
+        if not token_ids or not outcomes or len(token_ids) != len(outcomes):
+            return refs
+
+        event_slug = event.get("slug") or event.get("id") or ""
+        event_url = f"https://polymarket.com/event/{event_slug}" if event_slug else "https://polymarket.com"
+
+        for token_id, outcome_name in zip(token_ids, outcomes):
+            outcome_name_str = str(outcome_name).strip()
+            if not self._is_supported_outcome(outcome_name_str, sport):
+                continue
+            key = f"{market.get('id') or market.get('conditionId') or market.get('question') or market.get('title')}::{outcome_name_str}"
+            refs[key] = OutcomeRef(
+                key=key,
+                asset_id=str(token_id),
+                outcome_name=outcome_name_str,
+                sport=sport,
+                league=league,
+                event_title=str(event.get("title") or event.get("question") or ""),
+                market_title=str(market.get("question") or market.get("title") or ""),
+                event_url=event_url,
+                start_time=event_start.isoformat(),
+                event_live=bool(event.get("live")),
+                event_ended=bool(event.get("ended")),
+            )
+        return refs
+
+    def _choose_event_start(
+        self,
+        event: Dict[str, Any],
+        markets: List[Dict[str, Any]],
+    ) -> Tuple[Optional[datetime], str]:
+        for field in SPORTS_EVENT_START_FIELDS:
+            parsed = self._parse_datetime(event.get(field))
+            if parsed is not None:
+                return parsed, f"event.{field}"
+
+        for field in SPORTS_MARKET_START_FIELDS:
+            market_candidates: List[Tuple[datetime, str]] = []
+            for market in markets:
+                parsed = self._parse_datetime(market.get(field))
+                if parsed is not None:
+                    market_candidates.append((parsed, f"market.{field}"))
+            if market_candidates:
+                market_candidates.sort(key=lambda item: item[0])
+                return market_candidates[0]
+
+        return None, "none"
+
+    def _is_primary_moneyline_market(self, market: Dict[str, Any], sport: str) -> bool:
+        title = " ".join(
+            [
+                str(market.get("question") or ""),
+                str(market.get("title") or ""),
+                str(market.get("description") or ""),
+            ]
+        ).lower()
+
+        if not title:
+            return False
+        if any(term in title for term in EXCLUDED_MARKET_TERMS):
+            return False
+        if any(flag for flag in (market.get("closed"), market.get("archived"), market.get("inactive"))):
+            return False
+
+        raw_outcomes = [str(item).strip() for item in self._json_list(market.get("outcomes")) if str(item).strip()]
+        outcomes = [item.lower() for item in raw_outcomes]
+        if len(raw_outcomes) not in {2, 3}:
+            return False
+        if any(item in {"yes", "no"} for item in outcomes) and "moneyline" not in title and "match winner" not in title:
+            return False
+        if sport == "football":
+            return outcomes in (["home", "away"], ["home", "draw", "away"]) or len(raw_outcomes) in {2, 3}
+        return outcomes == ["home", "away"] or len(raw_outcomes) == 2 or "moneyline" in title or "match winner" in title
+
+    def _market_fails_optional_filters(self, market: Dict[str, Any]) -> bool:
+        liquidity = self._safe_float(market.get("liquidity"))
+        volume24 = self._safe_float(market.get("volume24hr") or market.get("volume24h"))
+        if self.config.optional_min_liquidity is not None and (liquidity is None or liquidity < self.config.optional_min_liquidity):
+            return True
+        if self.config.optional_min_volume_24h is not None and (volume24 is None or volume24 < self.config.optional_min_volume_24h):
+            return True
+        return False
+
+    def _sport_league_allowed(self, sport: str, league: str) -> bool:
+        if sport not in {"football", "mlb", "mma", "nba", "nhl"}:
+            return False
+        if self.config.optional_league_allowlist:
+            normalized = league.lower()
+            return any(item in normalized for item in self.config.optional_league_allowlist)
+        return True
+
+    def _normalize_sport(self, event: Dict[str, Any]) -> str:
+        haystack = " ".join(
+            [
+                str(event.get("sport") or ""),
+                str(event.get("category") or ""),
+                str(event.get("title") or ""),
+            ]
+        ).lower()
+        if "soccer" in haystack or "football" in haystack:
+            return "football"
+        if "mlb" in haystack or "baseball" in haystack:
+            return "mlb"
+        if "mma" in haystack or "ufc" in haystack:
+            return "mma"
+        if "nba" in haystack or "basketball" in haystack:
+            return "nba"
+        if "nhl" in haystack or "hockey" in haystack:
+            return "nhl"
+        return haystack.strip()
+
+    def _normalize_league(self, event: Dict[str, Any]) -> str:
+        haystack = " ".join(
+            [
+                str(event.get("league") or ""),
+                str(event.get("competition") or ""),
+                str(event.get("title") or ""),
+            ]
+        ).lower()
+        for keyword, normalized in LEAGUE_KEYWORDS.items():
+            if keyword in haystack:
+                return normalized
+        return str(event.get("league") or event.get("competition") or "").strip()
+
+    def _is_event_inactive(self, event: Dict[str, Any]) -> bool:
+        return any(
+            bool(event.get(field))
+            for field in ("live", "closed", "ended", "archived", "started")
+        )
+
+    def _event_filter_reason(
+        self,
+        event: Dict[str, Any],
+        event_start: Optional[datetime],
+        now: datetime,
+        horizon: datetime,
+    ) -> Optional[str]:
+        return self._event_date_filter_reason(event_start, now, horizon) or self._event_activity_filter_reason(event, event_start, now)
+
+    def _event_date_filter_reason(
+        self,
+        event_start: Optional[datetime],
+        now: datetime,
+        horizon: datetime,
+    ) -> Optional[str]:
+        if not event_start:
+            return "no_start_time"
+        if event_start <= now:
+            return "started_already"
+        if event_start > horizon:
+            return "beyond_horizon"
+        return None
+
+    def _event_activity_filter_reason(
+        self,
+        event: Dict[str, Any],
+        event_start: Optional[datetime],
+        now: datetime,
+    ) -> Optional[str]:
+        if bool(event.get("live")):
+            return "live"
+        if bool(event.get("ended")):
+            return "ended"
+        if bool(event.get("closed")) or bool(event.get("archived")):
+            return "closed"
+        if bool(event.get("started")) or (event_start is not None and event_start <= now):
+            return "started_already"
+        return None
+
+    def _is_supported_outcome(self, outcome_name: str, sport: str) -> bool:
+        name = outcome_name.lower()
+        if name in {"yes", "no"}:
+            return False
+        if sport == "football":
+            return name not in {"home", "away"}
+        return name not in {"home", "away", "draw"}
+
+    def _log_refresh_debug(
+        self,
+        raw_events: int,
+        deduped_events: int,
+        raw_markets: int,
+        date_window_events: int,
+        active_events: int,
+        moneyline_events: int,
+        tracked_outcomes: int,
+    ) -> None:
+        logging.info(
+            "Universe debug: raw sports-tagged events=%s | deduped events=%s | raw markets=%s | after date window=%s | after exclude live/ended/started/closed=%s | after moneyline=%s | tracked outcomes=%s",
+            raw_events,
+            deduped_events,
+            raw_markets,
+            date_window_events,
+            active_events,
+            moneyline_events,
+            tracked_outcomes,
+        )
+
+    def _log_raw_event_dates(self, events: List[Dict[str, Any]], now: datetime, prefix: str) -> None:
+        limit = min(20, len(events))
+        logging.info("%s event date debug: showing first %s of %s", prefix, limit, len(events))
+        for idx, event in enumerate(events[:limit], start=1):
+            markets = event.get("markets") or []
+            chosen_start, chosen_source = self._choose_event_start(event, markets)
+            reason = self._event_filter_reason(event, chosen_start, now, now + timedelta(days=self.config.horizon_days)) or "passed"
+            event_values = {field: event.get(field) for field in DEBUG_DATE_FIELDS if event.get(field) not in (None, "")}
+            market_values = self._collect_market_date_values(markets)
+            logging.info(
+                "%s event %02d | title=%s | event.startTime=%s | event.eventStartTime=%s | event.eventDate=%s | event.startDate=%s | market.startTime=%s | market.eventStartTime=%s | market.eventDate=%s | market.startDate=%s | chosen_start=%s | chosen_source=%s | filter_reason=%s",
+                prefix,
+                idx,
+                str(event.get("title") or event.get("question") or ""),
+                event_values.get("startTime", "-"),
+                event_values.get("eventStartTime", "-"),
+                event_values.get("eventDate", "-"),
+                event_values.get("startDate", "-"),
+                market_values.get("startTime", "-"),
+                market_values.get("eventStartTime", "-"),
+                market_values.get("eventDate", "-"),
+                market_values.get("startDate", "-"),
+                chosen_start.isoformat() if chosen_start else "-",
+                chosen_source,
+                reason,
+            )
+
+    def _collect_market_date_values(self, markets: List[Dict[str, Any]]) -> Dict[str, Any]:
+        values: Dict[str, Any] = {}
+        for field in DEBUG_DATE_FIELDS:
+            for market in markets:
+                value = market.get(field)
+                if value not in (None, ""):
+                    values[field] = value
+                    break
+        return values
+
+    def _log_filter_reason_counts(self, counts: Dict[str, int]) -> None:
+        if not counts:
+            logging.info("Event filter reasons: none")
+            return
+        ordered = [
+            "sport_league_filtered",
+            "no_start_time",
+            "started_already",
+            "beyond_horizon",
+            "live",
+            "ended",
+            "closed",
+        ]
+        parts = [f"{reason}={counts[reason]}" for reason in ordered if counts.get(reason)]
+        for reason, count in counts.items():
+            if reason not in ordered:
+                parts.append(f"{reason}={count}")
+        logging.info("Event filter reasons: %s", " | ".join(parts))
+
+    def _log_candidate_events(self, candidates: List[CandidateEvent]) -> None:
+        if not candidates:
+            logging.info("Dry-run sports-tagged candidate events: 0")
+            return
+        logging.info("Dry-run sports-tagged candidate events: showing first %s of %s", min(20, len(candidates)), len(candidates))
+        for idx, candidate in enumerate(candidates[:20], start=1):
+            logging.info(
+                "Candidate %02d | sport=%s | league=%s | event=%s | start=%s | live=%s | ended=%s | markets=%s",
+                idx,
+                candidate.sport,
+                candidate.league or "-",
+                candidate.event_title,
+                candidate.start_time,
+                candidate.live,
+                candidate.ended,
+                candidate.markets_count,
+            )
+
+    def _log_tag_sources(self) -> None:
+        if not self.last_tag_sources:
+            logging.info("Sports tag sources used: none")
+            return
+        logging.info(
+            "Sports tag sources used: %s",
+            " | ".join(f"{tag_id}={source}" for tag_id, source in sorted(self.last_tag_sources.items())),
+        )
+
+    def _cooldown_expired(self, key: str, now_ts: float) -> bool:
+        last = self.cooldowns.get(key)
+        if last is None:
+            return True
+        return now_ts - last >= self.config.cooldown_minutes * 60
+
+    def _trim_history(self, history: Deque[Tuple[float, float]], now_ts: float) -> None:
+        min_ts = now_ts - (self.config.lookback_minutes * 60) - 60
+        while history and history[0][0] < min_ts:
+            history.popleft()
+
+    def _prune_history(self) -> None:
+        now_ts = time.time()
+        for history in self.price_history.values():
+            self._trim_history(history, now_ts)
+
+    def _price_at_lookback(self, history: Deque[Tuple[float, float]], now_ts: float) -> Optional[float]:
+        target = now_ts - self.config.lookback_minutes * 60
+        candidate: Optional[float] = None
+        for timestamp, price in history:
+            if timestamp <= target:
+                candidate = price
+            else:
+                break
+        return candidate
+
+    def _write_alert_csv(
+        self,
+        scanned_at: str,
+        ref: OutcomeRef,
+        old_price: float,
+        new_price: float,
+        move_pp: float,
+        direction: str,
+    ) -> None:
+        file_exists = self.alerts_csv_path.exists()
+        with self.alerts_csv_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            if not file_exists:
+                writer.writerow(
+                    [
+                        "scanned_at",
+                        "sport",
+                        "league",
+                        "event_title",
+                        "market_title",
+                        "event_url",
+                        "start_time",
+                        "asset_id or market_id",
+                        "old_best_ask",
+                        "new_best_ask",
+                        "ask_move_10m_pp",
+                        "direction",
+                        "live",
+                        "ended",
+                    ]
+                )
+            writer.writerow(
+                [
+                    scanned_at,
+                    ref.sport,
+                    ref.league,
+                    ref.event_title,
+                    ref.market_title,
+                    ref.event_url,
+                    ref.start_time,
+                    ref.asset_id,
+                    f"{old_price:.4f}",
+                    f"{new_price:.4f}",
+                    f"{move_pp:.2f}",
+                    direction,
+                    ref.event_live,
+                    ref.event_ended,
+                ]
+            )
+
+    def _format_alert(
+        self,
+        ref: OutcomeRef,
+        old_price: float,
+        new_price: float,
+        move_pp: float,
+        direction: str,
+    ) -> str:
+        return (
+            f"[{ref.sport.upper()} {ref.league}] {ref.event_title}\n"
+            f"Маркет: {ref.market_title} | Outcome: {ref.outcome_name}\n"
+            f"BEST ASK {direction}: {old_price:.3f} -> {new_price:.3f} ({move_pp:.2f} pp за {self.config.lookback_minutes}m)\n"
+            f"Старт: {ref.start_time}\n"
+            f"{ref.event_url}"
+        )
+
+    def _load_state(self) -> None:
+        if not self.state_json_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_json_path.read_text(encoding="utf-8"))
+            raw_history = payload.get("price_history", {})
+            for key, values in raw_history.items():
+                self.price_history[key] = deque((float(ts), float(price)) for ts, price in values)
+            self.cooldowns = {key: float(value) for key, value in payload.get("cooldowns", {}).items()}
+        except Exception as exc:
+            logging.warning("Не удалось загрузить state snapshot: %s", exc)
+
+    def _save_state(self) -> None:
+        serializable_history = {
+            key: list(history)[-128:]
+            for key, history in self.price_history.items()
+            if history
+        }
+        payload = {
+            "saved_at": datetime.now(tz=UTC).isoformat(),
+            "price_history": serializable_history,
+            "cooldowns": self.cooldowns,
+        }
+        self.state_json_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+
+    @staticmethod
+    def _json_list(value: Any) -> List[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                parsed = json.loads(stripped)
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return [item.strip() for item in stripped.split(",") if item.strip()]
+        return []
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_price_value(self, entry: Any) -> Optional[float]:
+        if not isinstance(entry, dict):
+            return self._safe_float(entry)
+        candidates = (
+            entry.get("best_ask"),
+            entry.get("bestAsk"),
+            entry.get("ask"),
+            entry.get("SELL"),
+            entry.get("sell"),
+            entry.get("price"),
+            entry.get("mid"),
+            entry.get("midpoint"),
+            entry.get("BUY"),
+            entry.get("buy"),
+        )
+        for candidate in candidates:
+            parsed = self._safe_float(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _extract_orderbook_price(self, entry: Any) -> Optional[float]:
+        if isinstance(entry, dict):
+            return self._safe_float(entry.get("price") or entry.get("rate") or entry.get("value"))
+        if isinstance(entry, (list, tuple)) and entry:
+            return self._safe_float(entry[0])
+        return None
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            normalized = str(value).replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if not parsed.tzinfo:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _csv_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            result: List[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    candidate = item.get("id") or item.get("tag_id") or item.get("tagId") or item.get("slug")
+                    if candidate:
+                        result.append(str(candidate).strip())
+                        continue
+                item_str = str(item).strip()
+                if item_str:
+                    result.append(item_str)
+            return result
+        return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def load_config() -> Config:
+    load_dotenv()
+
+    def env_str(key: str, default: str = "") -> str:
+        return os.getenv(key, default).strip()
+
+    def env_int(key: str, default: int) -> int:
+        raw = env_str(key, str(default))
+        return int(raw)
+
+    def env_float_optional(key: str) -> Optional[float]:
+        raw = env_str(key)
+        return float(raw) if raw else None
+
+    def env_bool(key: str, default: bool) -> bool:
+        raw = env_str(key)
+        if not raw:
+            return default
+        return raw.lower() in {"1", "true", "yes", "on"}
+
+    allowlist_raw = env_str("OPTIONAL_LEAGUE_ALLOWLIST")
+    allowlist = [item.strip().lower() for item in allowlist_raw.split(",") if item.strip()]
+
+    return Config(
+        tg_token=env_str("TG_TOKEN"),
+        tg_chat_id=env_str("TG_CHAT_ID"),
+        lookback_minutes=env_int("LOOKBACK_MINUTES", 10),
+        min_move_pp=float(env_str("MIN_MOVE_PP", "7")),
+        horizon_days=env_int("HORIZON_DAYS", 7),
+        cooldown_minutes=env_int("COOLDOWN_MINUTES", 15),
+        refresh_universe_sec=env_int("REFRESH_UNIVERSE_SEC", 300),
+        snapshot_dir=Path(env_str("SNAPSHOT_DIR", "./snapshots")),
+        optional_min_liquidity=env_float_optional("OPTIONAL_MIN_LIQUIDITY"),
+        optional_min_volume_24h=env_float_optional("OPTIONAL_MIN_VOLUME_24H"),
+        optional_league_allowlist=allowlist,
+        dry_run=env_bool("DRY_RUN", not env_str("TG_TOKEN") or not env_str("TG_CHAT_ID")),
+    )
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    config = load_config()
+    app = PolymarketSportsMovers(config)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+{
+  "name": "polymarket-sports-movers",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "build": "python3 - <<'INNER'\nfrom pathlib import Path\nsrc = Path(\"polymarket_movers.py\").read_text(encoding=\"utf-8\")\ncompile(src, \"polymarket_movers.py\", \"exec\")\nprint(\"syntax ok\")\nINNER",
+    "start": "python3 polymarket_movers.py"
+  }
+}
