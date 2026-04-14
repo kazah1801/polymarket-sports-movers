@@ -845,8 +845,9 @@ class PolymarketSportsMovers:
                     break
                 for tag_id in self._csv_list(item.get("tags")):
                     tag_haystack = _tag_haystack(tags_by_id.get(tag_id))
-                    if " all sports " in tag_haystack:
-                        continue
+                    if tag_haystack:
+                        if " all sports " in tag_haystack:
+                            continue
                     if not any(keyword in tag_haystack for keyword in aliases):
                         continue
                     resolved[tag_id] = f"sports:{sport_name}"
