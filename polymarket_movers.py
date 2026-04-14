@@ -39,8 +39,6 @@ SPORT_ALLOWLIST = {
     "football",
     "mlb",
     "baseball",
-    "mma",
-    "ufc",
     "nba",
     "basketball",
     "nhl",
@@ -66,8 +64,6 @@ LEAGUE_KEYWORDS = {
     "sea games": "SEA",
     "southeast asia": "SEA",
     "mlb": "MLB",
-    "ufc": "UFC",
-    "mma": "MMA",
     "nba": "NBA",
     "nhl": "NHL",
 }
@@ -98,10 +94,10 @@ DEBUG_DATE_FIELDS = ("startTime", "eventStartTime", "eventDate", "startDate")
 SPORTS_METADATA_SPORTS = {
     "football": ("soccer", "football"),
     "mlb": ("mlb", "baseball"),
-    "mma": ("mma", "ufc"),
     "nba": ("nba", "basketball"),
     "nhl": ("nhl", "hockey"),
 }
+
 TARGET_LEAGUE_TAGS = {
     "UCL": ("uefa champions league", "champions league", "ucl"),
     "LaLiga": ("laliga", "la liga"),
@@ -112,20 +108,19 @@ TARGET_LEAGUE_TAGS = {
     "Turkish League": ("super lig", "turkish super lig", "turkish league"),
     "SEA": ("sea games", "southeast asia"),
     "MLB": ("mlb", "major league baseball"),
-    "UFC": ("ufc", "mma"),
     "NBA": ("nba",),
     "NHL": ("nhl",),
 }
-ALLOWED_SPORTS = {"football", "mlb", "mma", "nba", "nhl"}
+
+ALLOWED_SPORTS = {"football", "mlb", "nba", "nhl"}
 ALLOWED_FOOTBALL_LEAGUES = {"UCL", "LaLiga", "Ligue 1", "Bundesliga", "UEL", "EPL", "Turkish League", "SEA"}
 ALLOWED_LEAGUES_BY_SPORT = {
     "football": ALLOWED_FOOTBALL_LEAGUES,
     "mlb": {"MLB"},
-    "mma": {"UFC", "MMA"},
     "nba": {"NBA"},
     "nhl": {"NHL"},
 }
-SPORT_SUMMARY_ORDER = ("football", "mlb", "mma", "nba", "nhl")
+SPORT_SUMMARY_ORDER = ("football", "mlb", "nba", "nhl")
 UNWANTED_SPORT_TERMS = (
     "cricket",
     "ipl",
