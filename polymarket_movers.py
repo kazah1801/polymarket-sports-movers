@@ -124,9 +124,7 @@ TARGET_LEAGUE_TAGS = {
     "EPL": ("premier league", "epl"),
     "Turkish League": ("super lig", "turkish super lig", "turkish league"),
     "SEA": ("sea games", "southeast asia"),
-    "MLB": ("mlb", "major league baseball"),
-    "NBA": ("nba",),
-    "NHL": ("nhl",),
+
 }
 ALLOWED_SPORTS = {"football", "mlb", "nba", "nhl"}
 ALLOWED_FOOTBALL_LEAGUES = {"UCL", "LaLiga", "Ligue 1", "Bundesliga", "UEL", "EPL", "Turkish League", "SEA"}
@@ -717,7 +715,7 @@ class PolymarketSportsMovers:
                         event_copy["_source_tags"] = [tag_source]
                         deduped_events[event_key] = event_copy
                     else:
-                        merged_sources = list(dict.fromkeys([*existing.get("_source_tags", []), tag_source]))
+                        merged_sources = self._merge_event_sources(existing, tag_source)
                         existing["_source_tags"] = merged_sources
                         if len(existing.get("markets") or []) < len(event.get("markets") or []):
                             for key, value in event.items():
@@ -726,6 +724,26 @@ class PolymarketSportsMovers:
                             existing["_source_tags"] = merged_sources
 
         return list(deduped_events.values()), tag_sources, len(raw_events), source_counts
+
+    def _merge_event_sources(self, event: Dict[str, Any], new_source: str) -> List[str]:
+        existing_sources = [str(item).strip() for item in event.get("_source_tags", []) if str(item).strip()]
+        merged = list(dict.fromkeys([*existing_sources, new_source]))
+        sports_sources = [item for item in merged if item.startswith("sports:")]
+        if len(sports_sources) <= 1:
+            return merged
+
+        haystack = " ".join(
+            str(event.get(field) or "")
+            for field in ("sport", "category", "league", "competition", "title", "question", "slug")
+        ).lower()
+        preferred = sports_sources[0]
+        for candidate in sports_sources:
+            sport_name = candidate.split(":", 1)[1].strip().lower()
+            if sport_name and sport_name in haystack:
+                preferred = candidate
+                break
+
+        return [item for item in merged if (not item.startswith("sports:")) or item == preferred]
 
     def _fetch_sports_metadata(self) -> List[Dict[str, Any]]:
         response = self._gamma_get("/sports")
@@ -803,7 +821,19 @@ class PolymarketSportsMovers:
         tags: List[Dict[str, Any]],
     ) -> Dict[str, str]:
         resolved: Dict[str, str] = {}
+        tags_by_id: Dict[str, Dict[str, Any]] = {
+            str(tag.get("id") or "").strip(): tag
+            for tag in tags
+            if str(tag.get("id") or "").strip()
+        }
 
+        def _tag_haystack(tag: Optional[Dict[str, Any]]) -> str:
+            if not isinstance(tag, dict):
+                return ""
+            label = str(tag.get("label") or "").strip()
+            slug = str(tag.get("slug") or "").strip()
+            return f" {label} {slug} ".lower()
+            
         for item in sports_metadata:
             sport_name = str(item.get("sport") or "").strip().lower()
             if not sport_name:
@@ -814,6 +844,11 @@ class PolymarketSportsMovers:
                 if normalized_sport == "football":
                     break
                 for tag_id in self._csv_list(item.get("tags")):
+                    tag_haystack = _tag_haystack(tags_by_id.get(tag_id))
+                    if " all sports " in tag_haystack:
+                        continue
+                    if not any(keyword in tag_haystack for keyword in aliases):
+                        continue
                     resolved[tag_id] = f"sports:{sport_name}"
                 break
 
@@ -821,23 +856,11 @@ class PolymarketSportsMovers:
             tag_id = str(tag.get("id") or "").strip()
             label = str(tag.get("label") or "").strip()
             slug = str(tag.get("slug") or "").strip()
-            haystack = f" {label} {slug} ".lower()
+            haystack = _tag_haystack(tag)
             if not tag_id or not haystack.strip():
                 continue
 
             if " all sports " in haystack:
-                continue
-
-            for sport_name, keywords in SPORTS_METADATA_SPORTS.items():
-                if sport_name == "football":
-                    continue
-                sports_prefixes = tuple(f" sports:{keyword}" for keyword in keywords) + tuple(
-                    f" sports-{keyword}" for keyword in keywords
-                )
-                if any(prefix in haystack for prefix in sports_prefixes):
-                    resolved[tag_id] = f"sports:{sport_name}"
-                    break
-            if tag_id in resolved:
                 continue
 
             if " sport " in haystack:
