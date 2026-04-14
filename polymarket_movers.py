@@ -725,27 +725,6 @@ class PolymarketSportsMovers:
                                     existing[key] = value
                             existing["_source_tags"] = merged_sources
 
-        broad_events = self._fetch_events_for_tag(None)
-        logging.info("Sports universe fetch: tag_id=* | source=events:all | events=%s", len(broad_events))
-        source_counts["events:all"]["raw"] += len(broad_events)
-        raw_events.extend(broad_events)
-        for event in broad_events:
-            event_key = str(event.get("id") or event.get("slug") or event.get("title") or "")
-            if not event_key:
-                continue
-            existing = deduped_events.get(event_key)
-            if existing is None:
-                event_copy = dict(event)
-                event_copy["_source_tags"] = ["events:all"]
-                deduped_events[event_key] = event_copy
-                continue
-            merged_sources = list(dict.fromkeys([*existing.get("_source_tags", []), "events:all"]))
-            existing["_source_tags"] = merged_sources
-            if len(existing.get("markets") or []) < len(event.get("markets") or []):
-                for key, value in event.items():
-                    if key != "_source_tags":
-                        existing[key] = value
-                existing["_source_tags"] = merged_sources
         return list(deduped_events.values()), tag_sources, len(raw_events), source_counts
 
     def _fetch_sports_metadata(self) -> List[Dict[str, Any]]:
