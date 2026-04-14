@@ -857,7 +857,28 @@ class PolymarketSportsMovers:
                     resolved[tag_id] = f"tags:{target_name}"
                     break
 
-        return dict(sorted(resolved.items(), key=lambda item: item[1]))
+        allowed_sources = {
+    "sports:mlb",
+    "sports:nba",
+    "sports:nhl",
+    "tags:UCL",
+    "tags:LaLiga",
+    "tags:Ligue 1",
+    "tags:Bundesliga",
+    "tags:UEL",
+    "tags:EPL",
+    "tags:Turkish League",
+    "tags:SEA",
+}
+
+resolved = {
+    tag_id: source
+    for tag_id, source in resolved.items()
+    if source in allowed_sources
+}
+
+return dict(sorted(resolved.items(), key=lambda item: item[1]))
+            
 
     def _fetch_best_asks(self, asset_ids: Iterable[str]) -> Tuple[Dict[str, PriceQuote], List[str], Dict[str, int]]:
         asset_list = [asset_id for asset_id in asset_ids if asset_id]
@@ -1622,30 +1643,33 @@ class PolymarketSportsMovers:
             reason,
         )
 
-    def _log_market_decision(
-        self,
-        prefix: str,
-        event: Dict[str, Any],
-        market: Dict[str, Any],
-        sport: str,
-        league: str,
-        market_start: Optional[datetime],
-        market_start_source: str,
-        reason: str,
-    ) -> None:
-        logging.info(
-            "%s | sport=%s | league=%s | event=%s | market=%s | start=%s | start_source=%s | outcomes=%s | slug=%s | reason=%s",
-            prefix,
-            self._log_field(sport or "-"),
-            self._log_field(league or "-"),
-            self._log_field(str(event.get("title") or event.get("question") or "-")),
-            self._log_field(str(market.get("question") or market.get("title") or "-")),
-            market_start.isoformat() if market_start else "-",
-            market_start_source,
-            self._log_field(",".join(str(item).strip() for item in self._json_list(market.get("outcomes")) if str(item).strip()) or "-"),
-            self._log_field(str(market.get("slug") or market.get("marketSlug") or "-")),
-            reason,
-        )
+def _log_market_decision(
+    self,
+    prefix: str,
+    event: Dict[str, Any],
+    market: Dict[str, Any],
+    sport: str,
+    league: str,
+    market_start: Optional[datetime],
+    market_start_source: str,
+    reason: str,
+) -> None:
+    if prefix == "REJECTED MARKET" and not self.config.log_rejected_events:
+        return
+
+    logging.info(
+        "%s | sport=%s | league=%s | event=%s | market=%s | start=%s | start_source=%s | outcomes=%s | slug=%s | reason=%s",
+        prefix,
+        self._log_field(sport or "-"),
+        self._log_field(league or "-"),
+        self._log_field(str(event.get("title") or event.get("question") or "-")),
+        self._log_field(str(market.get("question") or market.get("title") or "-")),
+        market_start.isoformat() if market_start else "-",
+        market_start_source,
+        self._log_field(",".join(str(item).strip() for item in self._json_list(market.get("outcomes")) if str(item).strip()) or "-"),
+        self._log_field(str(market.get("slug") or market.get("marketSlug") or "-")),
+        reason,
+    )
 
     def _looks_like_future_market_text(self, text: str) -> bool:
         lowered = f" {text.lower()} "
