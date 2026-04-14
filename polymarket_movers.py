@@ -2070,29 +2070,11 @@ def _resolve_target_tag_ids(
         self.state_json_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
 
     def _acquire_instance_lock(self) -> None:
-        handle = self.instance_lock_path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.seek(0)
-            holder = handle.read().strip() or "unknown"
-            handle.close()
-            raise RuntimeError(f"Уже запущен другой экземпляр бота: {holder}")
-        handle.seek(0)
-        handle.truncate()
-        handle.write(f"pid={os.getpid()} started_at={datetime.now(tz=UTC).isoformat()}\n")
-        handle.flush()
-        self.instance_lock_handle = handle
+        return
 
     def _release_instance_lock(self) -> None:
-        if self.instance_lock_handle is None:
-            return
-        try:
-            fcntl.flock(self.instance_lock_handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.instance_lock_handle.close()
-            self.instance_lock_handle = None
-
+        return
+        
     @staticmethod
     def _json_list(value: Any) -> List[Any]:
         if isinstance(value, list):
