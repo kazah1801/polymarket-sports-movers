@@ -83,7 +83,12 @@ EXCLUDED_MARKET_TERMS = (
     "1st half",
     "first half",
     "quarter",
+    "period",
     "inning",
+    "first inning",
+    "run scored in the first inning",
+    "nrfi",
+    "yrfi",
     "round",
     "method of victory",
 )
